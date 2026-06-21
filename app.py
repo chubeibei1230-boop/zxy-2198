@@ -114,6 +114,7 @@ app.layout = html.Div([
                         html.Br(),
                         html.Span(get_date_format_hint(), style={'fontSize': '12px', 'color': '#666', 'background': '#f5f5f5', 'padding': '8px', 'borderRadius': '6px', 'display': 'inline-block', 'marginTop': '8px'}),
                 ], className='modal-hint'),
+                html.Div(id='mapping-error', className='mapping-error hidden'),
                 html.Div(id='mapping-fields-container', className='mapping-fields'),
             ], className='modal-body'),
             html.Div([
@@ -267,6 +268,10 @@ app.layout = html.Div([
     Output('mapping-fields-container', 'children'),
     Output('store-raw-data', 'data'),
     Output('welcome-panel', 'className'),
+    Output('messages-panel', 'children', allow_duplicate=True),
+    Output('messages-panel', 'className', allow_duplicate=True),
+    Output('mapping-error', 'children'),
+    Output('mapping-error', 'className'),
     Input('upload-data', 'contents'),
     Input('mapping-close', 'n_clicks'),
     Input('mapping-cancel', 'n_clicks'),
@@ -281,14 +286,18 @@ def handle_upload_and_modal(contents, close_clicks, cancel_clicks, filename, mod
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
     if trigger_id in ('mapping-close', 'mapping-cancel'):
-        return 'modal-overlay hidden', no_update, no_update, 'welcome-panel'
+        return 'modal-overlay hidden', no_update, no_update, 'welcome-panel', no_update, no_update, '', 'mapping-error hidden'
 
     if trigger_id == 'upload-data' and contents:
         df, msg = parse_csv_from_contents(contents, filename or '')
         if df is None or len(df) == 0:
-            return (modal_class,
-                    html.Div([f'❌ {msg}'], style={'color': '#EF553B', 'padding': '20px'}),
-                    no_update, 'welcome-panel')
+            err_content = html.Div([
+                html.H4('❌ 文件解析失败'),
+                html.Div(msg, style={'color': '#EF553B', 'padding': '10px 0'}),
+                html.Div('请检查文件格式，确保是有效的 CSV 或 Excel 文件。', style={'color': '#666', 'fontSize': '13px'}),
+            ])
+            return ('modal-overlay hidden', no_update, no_update, 'welcome-panel',
+                    err_content, 'messages-panel error', '', 'mapping-error hidden')
         suggested = suggest_column_mapping(df.columns.tolist())
         mapping_fields = []
         for std_col, std_label in STANDARD_COLUMNS.items():
@@ -311,13 +320,15 @@ def handle_upload_and_modal(contents, close_clicks, cancel_clicks, filename, mod
                 ),
             ], className='mapping-field'))
         raw_json = df.to_json(orient='split', date_format='iso')
-        return 'modal-overlay', mapping_fields, raw_json, 'welcome-panel hidden'
+        return 'modal-overlay', mapping_fields, raw_json, 'welcome-panel hidden', no_update, no_update, '', 'mapping-error hidden'
 
     raise PreventUpdate
 
 
 @app.callback(
     Output('mapping-modal', 'className', allow_duplicate=True),
+    Output('mapping-error', 'children'),
+    Output('mapping-error', 'className'),
     Output('store-processed-data', 'data'),
     Output('store-messages', 'data'),
     Output('store-filter-options', 'data'),
@@ -338,17 +349,51 @@ def confirm_mapping_and_process(confirm_clicks, raw_json, mapping_ids, mapping_v
     try:
         df = pd.read_json(raw_json, orient='split')
     except Exception:
-        return (
-            'modal-overlay', no_update, no_update, no_update, 'dashboard-container hidden',
-            'welcome-panel', html.Div('❌ 原始数据解析失败'), 'messages-panel', True,
-        )
+        err_html = html.Div(['❌ 原始数据解析失败，请重新上传文件'],
+                            style={'color': '#EF553B', 'padding': '10px 14px',
+                                   'background': '#FFF5F5', 'borderRadius': '8px',
+                                   'border': '1px solid #FEB2B2', 'fontSize': '13px'})
+        return ('modal-overlay', err_html, 'mapping-error', no_update, no_update, no_update,
+                'dashboard-container hidden', 'welcome-panel', no_update, no_update, True)
+
+    REQUIRED_FIELDS = ['record_date', 'warehouse_area', 'picker_name', 'sku_count', 'pick_minutes']
     mapping = {}
+    mapped_sources = []
+    errors = []
+
     if isinstance(mapping_ids, list) and isinstance(mapping_values, list):
         for mid, val in zip(mapping_ids, mapping_values):
             if isinstance(mid, dict) and 'index' in mid:
                 std_col = mid['index']
                 if val and val != '__none__':
-                    mapping[val] = std_col
+                    mapped_sources.append((std_col, val))
+
+    src_to_std = {}
+    for std_col, src_col in mapped_sources:
+        if src_col in src_to_std:
+            errors.append(
+                f'❌ 源列「{src_col}」重复映射：已映射到「{src_to_std[src_col]}」，又映射到「{std_col}」'
+            )
+        else:
+            src_to_std[src_col] = std_col
+            mapping[src_col] = std_col
+
+    mapped_std = set(mapping.values())
+    missing_required = [f for f in REQUIRED_FIELDS if f not in mapped_std]
+    if missing_required:
+        errors.append(
+            f'❌ 缺少必填字段映射：{", ".join(missing_required)}'
+        )
+
+    if errors:
+        err_html = html.Div([
+            html.Strong('⚠️ 请修正以下问题后再继续：', style={'display': 'block', 'marginBottom': '6px'}),
+            html.Ul([html.Li(e, style={'margin': '4px 0 4px 20px', 'fontSize': '13px'}) for e in errors]),
+        ], style={'color': '#C53030', 'padding': '12px 14px', 'background': '#FFF5F5',
+                  'borderRadius': '8px', 'border': '1px solid #FEB2B2', 'lineHeight': '1.5'})
+        return ('modal-overlay', err_html, 'mapping-error', no_update, no_update, no_update,
+                'dashboard-container hidden', 'welcome-panel', no_update, no_update, True)
+
     df_mapped = apply_column_mapping(df, mapping)
     df_parsed, date_msgs = parse_all_dates(df_mapped)
     df_processed, validation_msgs = run_full_validation(df_parsed)
@@ -357,8 +402,9 @@ def confirm_mapping_and_process(confirm_clicks, raw_json, mapping_ids, mapping_v
         all_msgs['date_parse'] = date_msgs
         msg_elements = _flatten_messages(all_msgs)
         return (
-            'modal-overlay hidden', None, json.dumps(all_msgs, ensure_ascii=False),
-            None, 'dashboard-container hidden', 'welcome-panel',
+            'modal-overlay hidden', '', 'mapping-error hidden', None,
+            json.dumps(all_msgs, ensure_ascii=False), None,
+            'dashboard-container hidden', 'welcome-panel',
             html.Div([html.H4('⚠️ 数据处理结果：0 条有效记录'),
                       html.Div(msg_elements)]),
             'messages-panel error', True,
@@ -373,8 +419,9 @@ def confirm_mapping_and_process(confirm_clicks, raw_json, mapping_ids, mapping_v
     all_msgs['date_parse'] = date_msgs
     msg_elements = _flatten_messages(all_msgs)
     return (
-        'modal-overlay hidden', processed_json, json.dumps(all_msgs, ensure_ascii=False),
-        opts_json, 'dashboard-container', 'welcome-panel hidden',
+        'modal-overlay hidden', '', 'mapping-error hidden', processed_json,
+        json.dumps(all_msgs, ensure_ascii=False), opts_json,
+        'dashboard-container', 'welcome-panel hidden',
         html.Div([html.H4('✅ 数据处理完成'), html.Div(msg_elements)]),
         'messages-panel', False,
     )

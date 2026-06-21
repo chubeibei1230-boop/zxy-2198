@@ -56,16 +56,27 @@ def check_duplicate_waves(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Li
     )
     key_counts = Counter(df['_wave_key'].tolist())
     duplicate_indices = []
-    dup_keys = [k for k, c in key_counts.items() if c > 1 and k != '||']
+    dup_keys = []
+    for k, c in key_counts.items():
+        if c <= 1:
+            continue
+        parts = k.split('|')
+        if len(parts) >= 3 and parts[2].strip() == '':
+            continue
+        dup_keys.append(k)
     if dup_keys:
         for idx, row in df.iterrows():
             if row['_wave_key'] in dup_keys:
                 duplicate_indices.append(idx)
-        messages.append(f'检测到 {len(dup_keys)} 个重复波次组合，共涉及 {len(duplicate_indices)} 条记录')
+        messages.append(f'检测到 {len(dup_keys)} 个重复波次组合，共涉及 {len(duplicate_indices)} 条记录（备注为空的记录已跳过）')
         df['_is_duplicate_wave'] = df.index.isin(duplicate_indices)
     else:
         df['_is_duplicate_wave'] = False
-        messages.append('未检测到重复波次')
+        empty_note_count = (df['note'].fillna('').astype(str).str.strip() == '').sum()
+        if empty_note_count > 0:
+            messages.append(f'未检测到重复波次（{empty_note_count} 条记录备注为空，已跳过重复检查）')
+        else:
+            messages.append('未检测到重复波次')
     df = df.drop(columns=['_wave_key'])
     return df, messages, duplicate_indices
 
