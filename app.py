@@ -86,6 +86,7 @@ app.layout = html.Div([
     dcc.Store(id='store-messages', data=None),
     dcc.Store(id='store-filter-options', data=None),
     dcc.Store(id='store-picker-diagnosis', data=None),
+    dcc.Store(id='store-all-filter-options', data=None),
     dcc.Download(id='download-export'),
 
     html.Header([
@@ -359,6 +360,7 @@ def handle_upload_and_modal(contents, close_clicks, cancel_clicks, filename, mod
     Output('store-processed-data', 'data'),
     Output('store-messages', 'data'),
     Output('store-filter-options', 'data'),
+    Output('store-all-filter-options', 'data'),
     Output('dashboard-container', 'className'),
     Output('welcome-panel', 'className', allow_duplicate=True),
     Output('messages-panel', 'children'),
@@ -380,7 +382,7 @@ def confirm_mapping_and_process(confirm_clicks, raw_json, mapping_ids, mapping_v
                             style={'color': '#EF553B', 'padding': '10px 14px',
                                    'background': '#FFF5F5', 'borderRadius': '8px',
                                    'border': '1px solid #FEB2B2', 'fontSize': '13px'})
-        return ('modal-overlay', err_html, 'mapping-error', no_update, no_update, no_update,
+        return ('modal-overlay', err_html, 'mapping-error', no_update, no_update, no_update, no_update,
                 'dashboard-container hidden', 'welcome-panel', no_update, no_update, True)
 
     REQUIRED_FIELDS = ['record_date', 'warehouse_area', 'picker_name', 'sku_count', 'pick_minutes']
@@ -418,7 +420,7 @@ def confirm_mapping_and_process(confirm_clicks, raw_json, mapping_ids, mapping_v
             html.Ul([html.Li(e, style={'margin': '4px 0 4px 20px', 'fontSize': '13px'}) for e in errors]),
         ], style={'color': '#C53030', 'padding': '12px 14px', 'background': '#FFF5F5',
                   'borderRadius': '8px', 'border': '1px solid #FEB2B2', 'lineHeight': '1.5'})
-        return ('modal-overlay', err_html, 'mapping-error', no_update, no_update, no_update,
+        return ('modal-overlay', err_html, 'mapping-error', no_update, no_update, no_update, no_update,
                 'dashboard-container hidden', 'welcome-panel', no_update, no_update, True)
 
     df_mapped = apply_column_mapping(df, mapping)
@@ -430,7 +432,7 @@ def confirm_mapping_and_process(confirm_clicks, raw_json, mapping_ids, mapping_v
         msg_elements = _flatten_messages(all_msgs)
         return (
             'modal-overlay hidden', '', 'mapping-error hidden', None,
-            json.dumps(all_msgs, ensure_ascii=False), None,
+            json.dumps(all_msgs, ensure_ascii=False), None, None,
             'dashboard-container hidden', 'welcome-panel',
             html.Div([html.H4('⚠️ 数据处理结果：0 条有效记录'),
                       html.Div(msg_elements)]),
@@ -442,12 +444,30 @@ def confirm_mapping_and_process(confirm_clicks, raw_json, mapping_ids, mapping_v
     opts_json = json.dumps({k: (v.isoformat() if hasattr(v, 'isoformat') else v) if not isinstance(v, tuple) else
                               [x.isoformat() if hasattr(x, 'isoformat') else x for x in v]
                             for k, v in opts.items()}, ensure_ascii=False)
+    area_to_pickers = {}
+    picker_to_areas = {}
+    for _, row in df_final.iterrows():
+        area = str(row.get('warehouse_area', ''))
+        picker = str(row.get('picker_name', ''))
+        if area not in area_to_pickers:
+            area_to_pickers[area] = set()
+        area_to_pickers[area].add(picker)
+        if picker not in picker_to_areas:
+            picker_to_areas[picker] = set()
+        picker_to_areas[picker].add(area)
+    all_opts = {
+        'warehouse_areas': sorted(list(area_to_pickers.keys())),
+        'picker_names': sorted(list(picker_to_areas.keys())),
+        'area_to_pickers': {k: sorted(list(v)) for k, v in area_to_pickers.items()},
+        'picker_to_areas': {k: sorted(list(v)) for k, v in picker_to_areas.items()},
+    }
+    all_opts_json = json.dumps(all_opts, ensure_ascii=False)
     all_msgs = validation_msgs
     all_msgs['date_parse'] = date_msgs
     msg_elements = _flatten_messages(all_msgs)
     return (
         'modal-overlay hidden', '', 'mapping-error hidden', processed_json,
-        json.dumps(all_msgs, ensure_ascii=False), opts_json,
+        json.dumps(all_msgs, ensure_ascii=False), opts_json, all_opts_json,
         'dashboard-container', 'welcome-panel hidden',
         html.Div([html.H4('✅ 数据处理完成'), html.Div(msg_elements)]),
         'messages-panel', False,
@@ -523,6 +543,53 @@ def update_range_displays(sku_val, wait_val):
     sku_msg = f'SKU数范围: {sku_val[0]} ~ {sku_val[1]}' if sku_val else ''
     wait_msg = f'等待范围: {wait_val[0]:.1f} ~ {wait_val[1]:.1f} 分钟' if wait_val else ''
     return sku_msg, wait_msg
+
+
+@app.callback(
+    Output('filter-picker', 'options', allow_duplicate=True),
+    Output('filter-area', 'options', allow_duplicate=True),
+    Input('filter-area', 'value'),
+    Input('filter-picker', 'value'),
+    Input('store-all-filter-options', 'data'),
+    prevent_initial_call=True,
+)
+def cascade_filter_options(selected_areas, selected_pickers, all_opts_json):
+    ctx = callback_context
+    if not ctx.triggered or not all_opts_json:
+        raise PreventUpdate
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    try:
+        all_opts = json.loads(all_opts_json)
+    except Exception:
+        raise PreventUpdate
+    all_areas = all_opts.get('warehouse_areas', [])
+    all_pickers = all_opts.get('picker_names', [])
+    area_to_pickers = all_opts.get('area_to_pickers', {})
+    picker_to_areas = all_opts.get('picker_to_areas', {})
+
+    if trigger_id == 'filter-area':
+        if not selected_areas or len(selected_areas) == 0:
+            picker_opts = [{'label': p, 'value': p} for p in all_pickers]
+        else:
+            valid_pickers = set()
+            for area in selected_areas:
+                for p in area_to_pickers.get(area, []):
+                    valid_pickers.add(p)
+            picker_opts = [{'label': p, 'value': p} for p in sorted(valid_pickers)]
+        area_opts = no_update
+    elif trigger_id == 'filter-picker':
+        if not selected_pickers or len(selected_pickers) == 0:
+            area_opts = [{'label': a, 'value': a} for a in all_areas]
+        else:
+            valid_areas = set()
+            for picker in selected_pickers:
+                for a in picker_to_areas.get(picker, []):
+                    valid_areas.add(a)
+            area_opts = [{'label': a, 'value': a} for a in sorted(valid_areas)]
+        picker_opts = no_update
+    else:
+        raise PreventUpdate
+    return picker_opts, area_opts
 
 
 @app.callback(
@@ -747,10 +814,24 @@ def export_results(n_clicks, processed_json, diagnosis_json, start_date, end_dat
 
     diagnosis = None
     picker_suggestions = None
+    all_warnings = []
+    if len(df_filtered) == 0:
+        all_warnings.append('当前筛选条件下无有效数据，导出结果不具备参考价值')
+    else:
+        min_waves = 5
+        if len(df_filtered) < 20:
+            all_warnings.append(f'当前筛选范围内仅有 {len(df_filtered)} 条记录，数据量偏少，统计结论参考价值有限')
+        max_date = df_filtered['date_only'].max() if 'date_only' in df_filtered.columns and len(df_filtered) > 0 else None
+        min_date = df_filtered['date_only'].min() if 'date_only' in df_filtered.columns and len(df_filtered) > 0 else None
+        if max_date and min_date and (max_date - min_date).days < 3:
+            all_warnings.append(f'时间跨度仅 {(max_date - min_date).days + 1} 天，建议扩大日期范围以获得更稳定结论')
     if diagnosis_json:
         try:
             diagnosis = json.loads(diagnosis_json)
             picker_suggestions = generate_picker_improvement_suggestions(diagnosis)
+            diag_warnings = diagnosis.get('warnings', [])
+            if diag_warnings:
+                all_warnings.extend(diag_warnings)
         except Exception:
             pass
 
@@ -759,6 +840,7 @@ def export_results(n_clicks, processed_json, diagnosis_json, start_date, end_dat
         area_rank=rank_df, trend_df=trend_df, anomaly_df=anomaly_df,
         suggestions=suggestions, picker_diagnosis=diagnosis,
         picker_suggestions=picker_suggestions,
+        warnings=all_warnings,
     )
     fname = generate_download_filename('仓储数据分析')
     return dcc.send_bytes(workbook_bytes, filename=fname)

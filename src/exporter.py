@@ -14,6 +14,7 @@ def build_export_workbook(
     suggestions: List[Dict] = None,
     picker_diagnosis: Dict = None,
     picker_suggestions: List[Dict] = None,
+    warnings: List[str] = None,
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -144,6 +145,10 @@ def build_export_workbook(
             if sug_imp_rows:
                 imp_df = pd.DataFrame(sug_imp_rows)
                 imp_df.to_excel(writer, sheet_name='人员改进建议', index=False)
+        if warnings and len(warnings) > 0:
+            warn_rows = [{'序号': i + 1, '警告内容': w} for i, w in enumerate(warnings)]
+            warn_df = pd.DataFrame(warn_rows)
+            warn_df.to_excel(writer, sheet_name='数据质量说明', index=False)
     return output.getvalue()
 
 

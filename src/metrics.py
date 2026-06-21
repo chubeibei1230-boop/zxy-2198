@@ -197,6 +197,11 @@ def compute_picker_diagnosis(df: pd.DataFrame) -> Dict:
     wait_iqr_q1 = picker_stats['avg_wait'].quantile(0.25) if len(picker_stats) >= 4 else 10
     wait_upper = wait_iqr_q3 + 1.5 * (wait_iqr_q3 - wait_iqr_q1)
     wait_threshold = max(wait_upper, 30)
+
+    error_record_threshold = max(error_q75, 0.5) if overall_error > 0 else 0.5
+    wait_record_threshold = max(wait_threshold, 30)
+    eff_record_threshold = eff_q25
+
     labels_list = []
     for _, row in picker_stats.iterrows():
         labels = []
@@ -217,6 +222,7 @@ def compute_picker_diagnosis(df: pd.DataFrame) -> Dict:
         warnings.append(f'当前仅 {len(picker_stats)} 位拣货员，样本量过少，标签判定参考价值有限，建议扩大筛选范围')
     if len(picker_stats) >= 3 and picker_stats['waves'].max() < 5:
         warnings.append('所有拣货员波次数均不足 5 次，统计数据稳定性较差，建议增加日期范围')
+
     daily_trend = df.groupby(['date_only', 'picker_name']).agg(
         waves=('picker_name', 'size'),
         total_sku=('sku_count', 'sum'),
@@ -228,15 +234,51 @@ def compute_picker_diagnosis(df: pd.DataFrame) -> Dict:
     daily_trend['avg_eff'] = daily_trend['avg_eff'].round(3)
     daily_trend['avg_error_rate'] = daily_trend['avg_error_rate'].round(2)
     daily_trend['avg_wait'] = daily_trend['avg_wait'].round(2)
+
+    all_dates_sorted = sorted(df['date_only'].dropna().unique().tolist())
+    recent_cutoff_date = None
+    if all_dates_sorted:
+        from datetime import timedelta
+        latest_date = all_dates_sorted[-1]
+        if hasattr(latest_date, 'to_pydatetime'):
+            latest_date = latest_date.to_pydatetime().date() if hasattr(latest_date, 'to_pydatetime') else latest_date
+        recent_cutoff_date = latest_date - timedelta(days=6)
+
     picker_records = []
     for _, row in picker_stats.iterrows():
         name = row['picker_name']
         person_daily = daily_trend[daily_trend['picker_name'] == name].copy()
         person_daily = person_daily.sort_values('date_only')
-        person_anomalies = df[
-            (df['picker_name'] == name)
-            & ((df.get('_is_anomalous_wait', False)) | (df.get('_is_duplicate_wave', False)))
-        ].copy()
+
+        if recent_cutoff_date is not None and len(person_daily) > 0:
+            date_series = pd.to_datetime(person_daily['date_only']).dt.date
+            person_daily_recent = person_daily[date_series >= recent_cutoff_date].copy()
+            if len(person_daily_recent) == 0:
+                person_daily_recent = person_daily.tail(7).copy()
+        else:
+            person_daily_recent = person_daily.tail(7).copy()
+
+        person_daily_all = person_daily.copy()
+        person_daily_recent_sorted = person_daily_recent.sort_values('date_only')
+
+        person_df = df[df['picker_name'] == name].copy()
+        anomaly_records_mask = pd.Series(False, index=person_df.index)
+        if '_is_anomalous_wait' in person_df.columns:
+            anomaly_records_mask = anomaly_records_mask | person_df['_is_anomalous_wait']
+        if '_is_duplicate_wave' in person_df.columns:
+            anomaly_records_mask = anomaly_records_mask | person_df['_is_duplicate_wave']
+        anomaly_records_mask = anomaly_records_mask | (person_df['error_count'] >= 1)
+        if '效率偏低' in row['labels']:
+            anomaly_records_mask = anomaly_records_mask | (person_df['sku_per_minute'] < eff_record_threshold)
+        if '等待异常' in row['labels']:
+            anomaly_records_mask = anomaly_records_mask | (person_df['pack_wait_minutes'] >= wait_record_threshold)
+        if '差异偏高' in row['labels']:
+            anomaly_records_mask = anomaly_records_mask | (person_df['error_rate'] >= error_record_threshold)
+
+        person_anomalies = person_df[anomaly_records_mask].copy()
+        if len(person_anomalies) > 0 and len(person_anomalies) > 20:
+            person_anomalies = person_anomalies.nlargest(20, ['error_count', 'pack_wait_minutes'])
+
         anomaly_list = []
         if len(person_anomalies) > 0:
             for _, ar in person_anomalies.iterrows():
@@ -245,6 +287,17 @@ def compute_picker_diagnosis(df: pd.DataFrame) -> Dict:
                     reasons.append(f"异常等待({ar.get('pack_wait_minutes', 0):.1f}分)")
                 if ar.get('_is_duplicate_wave', False):
                     reasons.append('重复波次')
+                if ar.get('error_count', 0) >= 1:
+                    reasons.append(f"差异{int(ar.get('error_count', 0))}件")
+                if '效率偏低' in row['labels'] and ar.get('sku_per_minute', 0) < eff_record_threshold:
+                    reasons.append(f"低效({ar.get('sku_per_minute', 0):.2f}SKU/分)")
+                if '等待异常' in row['labels'] and not ar.get('_is_anomalous_wait', False) and ar.get('pack_wait_minutes', 0) >= wait_record_threshold:
+                    reasons.append(f"等待过长({ar.get('pack_wait_minutes', 0):.1f}分)")
+                if not reasons:
+                    if ar.get('error_count', 0) >= 1:
+                        reasons.append(f"差异{int(ar.get('error_count', 0))}件")
+                    else:
+                        continue
                 anomaly_list.append({
                     'date': str(ar.get('date_only', '')),
                     'area': str(ar.get('warehouse_area', '')),
@@ -255,6 +308,25 @@ def compute_picker_diagnosis(df: pd.DataFrame) -> Dict:
                     'note': str(ar.get('note', '')),
                     'reasons': '、'.join(reasons),
                 })
+
+        if len(anomaly_list) == 0 and any(l in row['labels'] for l in ['效率偏低', '差异偏高', '等待异常']):
+            top_low = person_df.nsmallest(3, 'sku_per_minute')
+            for _, ar in top_low.iterrows():
+                reasons = []
+                if ar.get('sku_per_minute', 0) < eff_record_threshold:
+                    reasons.append(f"低效({ar.get('sku_per_minute', 0):.2f}SKU/分)")
+                if reasons:
+                    anomaly_list.append({
+                        'date': str(ar.get('date_only', '')),
+                        'area': str(ar.get('warehouse_area', '')),
+                        'sku_count': int(ar.get('sku_count', 0)),
+                        'pick_minutes': float(ar.get('pick_minutes', 0)),
+                        'error_count': int(ar.get('error_count', 0)),
+                        'pack_wait_minutes': float(ar.get('pack_wait_minutes', 0)),
+                        'note': str(ar.get('note', '')),
+                        'reasons': '、'.join(reasons),
+                    })
+
         picker_records.append({
             'picker_name': name,
             'waves': int(row['waves']),
@@ -264,7 +336,8 @@ def compute_picker_diagnosis(df: pd.DataFrame) -> Dict:
             'avg_wait': float(row['avg_wait']),
             'total_error_count': int(row['total_error_count']),
             'labels': row['labels'],
-            'daily_trend': person_daily[['date_only', 'waves', 'total_sku', 'avg_eff', 'avg_error_rate', 'avg_wait']].to_dict('records'),
+            'daily_trend': person_daily_recent_sorted[['date_only', 'waves', 'total_sku', 'avg_eff', 'avg_error_rate', 'avg_wait']].to_dict('records'),
+            'daily_trend_all': person_daily_all[['date_only', 'waves', 'total_sku', 'avg_eff', 'avg_error_rate', 'avg_wait']].to_dict('records'),
             'anomaly_details': anomaly_list,
         })
     return {
