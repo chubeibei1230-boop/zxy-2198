@@ -14,11 +14,12 @@ from src.metrics import (
     compute_base_metrics, filter_dataframe, compute_overall_summary,
     compute_pick_time_distribution, compute_error_stats, compute_area_ranking,
     compute_picker_workload, compute_pack_wait_trend, get_anomaly_details,
-    get_filter_options,
+    get_filter_options, compute_picker_diagnosis, generate_picker_improvement_suggestions,
 )
 from src.charts import (
     create_pick_time_distribution, create_error_rate_pie, create_area_efficiency_ranking,
     create_picker_workload_heatmap, create_pack_wait_trend, create_kpi_cards, _empty_fig,
+    create_picker_diagnosis_overview, create_picker_trend_chart, LABEL_COLORS,
 )
 from src.exporter import build_export_workbook, generate_download_filename
 from src.optimizer import generate_optimization_suggestions, get_suggestion_summary
@@ -84,6 +85,7 @@ app.layout = html.Div([
     dcc.Store(id='store-processed-data', data=None),
     dcc.Store(id='store-messages', data=None),
     dcc.Store(id='store-filter-options', data=None),
+    dcc.Store(id='store-picker-diagnosis', data=None),
     dcc.Download(id='download-export'),
 
     html.Header([
@@ -250,6 +252,31 @@ app.layout = html.Div([
                 html.Div(id='optimization-suggestions'),
             ]),
         ], open=True, className='details-panel optimization-panel'),
+
+        html.Details([
+            html.Summary('🔬 拣货员绩效诊断',
+                         style={'cursor': 'pointer', 'fontWeight': 'bold', 'padding': '12px',
+                                'fontSize': '16px', 'borderBottom': '1px solid #eee'}),
+            html.Div([
+                html.Div(id='picker-diagnosis-warnings'),
+                html.Div(id='picker-diagnosis-overview-chart', className='chart-box', style={'marginBottom': '16px'}),
+                html.Div(id='picker-diagnosis-table-container'),
+                html.Div([
+                    html.H4('📋 改进建议（面向主管）', style={'margin': '20px 0 10px', 'fontSize': '15px', 'color': '#2c3e50'}),
+                    html.Div(id='picker-diagnosis-suggestions'),
+                ]),
+            ], className='picker-diagnosis-panel'),
+        ], open=True, className='details-panel picker-diagnosis-wrapper'),
+
+        html.Div(id='picker-detail-modal', className='modal-overlay hidden', children=[
+            html.Div(className='modal-box', style={'maxWidth': '900px'}, children=[
+                html.Div([
+                    html.H3(id='picker-detail-modal-title', className='modal-title'),
+                    html.Button('✕', id='picker-detail-close', className='modal-close'),
+                ], className='modal-header'),
+                html.Div(id='picker-detail-modal-body', className='modal-body'),
+            ]),
+        ]),
 
     ]),
 
@@ -510,6 +537,11 @@ def update_range_displays(sku_val, wait_val):
     Output('optimization-summary', 'children'),
     Output('optimization-summary-title', 'children'),
     Output('optimization-suggestions', 'children'),
+    Output('store-picker-diagnosis', 'data'),
+    Output('picker-diagnosis-warnings', 'children'),
+    Output('picker-diagnosis-overview-chart', 'children'),
+    Output('picker-diagnosis-table-container', 'children'),
+    Output('picker-diagnosis-suggestions', 'children'),
     Input('store-processed-data', 'data'),
     Input('filter-date', 'start_date'),
     Input('filter-date', 'end_date'),
@@ -533,7 +565,8 @@ def render_all_dashboard(
             except Exception:
                 pass
     except Exception:
-        return [], _empty_fig(''), _empty_fig(''), _empty_fig(''), _empty_fig(''), _empty_fig(''), [], [], [], '', ''
+        return ([], _empty_fig(''), _empty_fig(''), _empty_fig(''), _empty_fig(''), _empty_fig(''),
+                [], [], [], '', '', None, None, None, None, None)
 
     date_r = (start_date, end_date) if start_date or end_date else None
     df = filter_dataframe(df_full, date_range=date_r, warehouse_areas=areas,
@@ -584,11 +617,93 @@ def render_all_dashboard(
     sug_title = f'💡 流程优化建议 ({sug_summary["total"]} 条) - 点击展开'
     sug_cards = _build_suggestion_cards(suggestions[:15])
 
+    diagnosis = compute_picker_diagnosis(df)
+    diagnosis_json = json.dumps(diagnosis, ensure_ascii=False, default=str)
+
+    diag_warnings = None
+    if diagnosis.get('warnings'):
+        diag_warnings = html.Div([
+            html.Div(w, style={'padding': '6px 12px', 'fontSize': '13px', 'color': '#C05621',
+                               'background': '#FFFBEB', 'borderRadius': '6px', 'marginBottom': '6px',
+                               'border': '1px solid #F6E05E'})
+            for w in diagnosis['warnings']
+        ], style={'marginBottom': '12px'})
+
+    diag_fig = create_picker_diagnosis_overview(diagnosis)
+    diag_chart = dcc.Graph(figure=diag_fig)
+
+    diag_table = None
+    if diagnosis.get('pickers'):
+        table_rows = []
+        for p in diagnosis['pickers']:
+            label_chips = html.Div([
+                html.Span(label, className='picker-label-chip',
+                          style={'background': LABEL_COLORS.get(label, '#636EFA') + '22',
+                                 'color': LABEL_COLORS.get(label, '#636EFA'),
+                                 'borderColor': LABEL_COLORS.get(label, '#636EFA')})
+                for label in p['labels']
+            ], className='picker-label-chips')
+            table_rows.append(html.Tr([
+                html.Td(html.Button(p['picker_name'], id={'type': 'picker-detail-btn', 'index': p['picker_name']},
+                                    className='picker-name-btn', n_clicks=0),
+                        style={'minWidth': '80px'}),
+                html.Td(f"{p['avg_eff']:.3f}", style={'textAlign': 'center'}),
+                html.Td(f"{p['avg_error_rate']:.2f}%", style={'textAlign': 'center'}),
+                html.Td(f"{p['avg_wait']:.1f}", style={'textAlign': 'center'}),
+                html.Td(str(p['waves']), style={'textAlign': 'center'}),
+                html.Td(f"{p['total_sku']:,}", style={'textAlign': 'center'}),
+                html.Td(label_chips, style={'minWidth': '200px'}),
+            ]))
+        diag_table = html.Div([
+            html.Table([
+                html.Thead(html.Tr([
+                    html.Th('拣货员'),
+                    html.Th('效率(SKU/分)'),
+                    html.Th('差异率'),
+                    html.Th('等待(分)'),
+                    html.Th('波次数'),
+                    html.Th('总SKU'),
+                    html.Th('诊断标签'),
+                ])),
+                html.Tbody(table_rows),
+            ], className='picker-diagnosis-table'),
+        ], className='picker-diagnosis-table-wrapper')
+
+    picker_imp_sugs = generate_picker_improvement_suggestions(diagnosis)
+    diag_suggestions = None
+    if picker_imp_sugs:
+        sug_cards_list = []
+        for s in picker_imp_sugs:
+            label_chips_html = ' '.join(
+                f'<span style="background:{LABEL_COLORS.get(l, "#636EFA")}22;color:{LABEL_COLORS.get(l, "#636EFA")};'
+                f'padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;'
+                f'border:1px solid {LABEL_COLORS.get(l, "#636EFA")}">{l}</span>'
+                for l in s['labels']
+            )
+            sug_cards_list.append(html.Div([
+                html.Div([
+                    html.Strong(s['picker']),
+                    html.Span(' · ', style={'color': '#ccc'}),
+                    html.Div(dcc.Markdown(label_chips_html, dangerously_allow_html=True),
+                             style={'display': 'inline'}),
+                ], style={'marginBottom': '6px', 'fontSize': '14px'}),
+                html.Div(f"判定依据: {s['reason']}", style={'fontSize': '13px', 'color': '#555', 'marginBottom': '4px'}),
+                html.Div(f"💡 {s['advice']}", style={'fontSize': '13px', 'color': '#2c3e50', 'fontWeight': '500'}),
+            ], className='picker-sug-card'))
+        diag_suggestions = html.Div(sug_cards_list, className='picker-sug-grid')
+    elif diagnosis.get('pickers'):
+        diag_suggestions = html.Div('所有拣货员表现正常，暂无改进建议', style={'padding': '16px', 'color': '#999', 'textAlign': 'center'})
+
     return (
         kpi_component,
         fig_dist, fig_error, fig_rank, fig_work, fig_trend,
         table_data, table_cols,
         summary_chips, sug_title, sug_cards,
+        diagnosis_json,
+        diag_warnings,
+        diag_chart,
+        diag_table,
+        diag_suggestions,
     )
 
 
@@ -596,6 +711,7 @@ def render_all_dashboard(
     Output('download-export', 'data'),
     Input('btn-export', 'n_clicks'),
     State('store-processed-data', 'data'),
+    State('store-picker-diagnosis', 'data'),
     State('filter-date', 'start_date'),
     State('filter-date', 'end_date'),
     State('filter-area', 'value'),
@@ -605,7 +721,7 @@ def render_all_dashboard(
     State('filter-wait-range', 'value'),
     prevent_initial_call=True,
 )
-def export_results(n_clicks, processed_json, start_date, end_date, areas, pickers, sku_range, error_status, wait_range):
+def export_results(n_clicks, processed_json, diagnosis_json, start_date, end_date, areas, pickers, sku_range, error_status, wait_range):
     if not processed_json or not n_clicks:
         raise PreventUpdate
     try:
@@ -629,13 +745,145 @@ def export_results(n_clicks, processed_json, start_date, end_date, areas, picker
     anomaly_df = get_anomaly_details(df_filtered)
     suggestions = generate_optimization_suggestions(df_filtered, summary, rank_df)
 
+    diagnosis = None
+    picker_suggestions = None
+    if diagnosis_json:
+        try:
+            diagnosis = json.loads(diagnosis_json)
+            picker_suggestions = generate_picker_improvement_suggestions(diagnosis)
+        except Exception:
+            pass
+
     workbook_bytes = build_export_workbook(
         raw_df=df_full, filtered_df=df_filtered, summary=summary,
         area_rank=rank_df, trend_df=trend_df, anomaly_df=anomaly_df,
-        suggestions=suggestions,
+        suggestions=suggestions, picker_diagnosis=diagnosis,
+        picker_suggestions=picker_suggestions,
     )
     fname = generate_download_filename('仓储数据分析')
     return dcc.send_bytes(workbook_bytes, filename=fname)
+
+
+@app.callback(
+    Output('picker-detail-modal', 'className'),
+    Output('picker-detail-modal-title', 'children'),
+    Output('picker-detail-modal-body', 'children'),
+    Input({'type': 'picker-detail-btn', 'index': ALL}, 'n_clicks'),
+    Input('picker-detail-close', 'n_clicks'),
+    State('store-picker-diagnosis', 'data'),
+    prevent_initial_call=True,
+)
+def show_picker_detail(n_clicks_list, close_clicks, diagnosis_json):
+    ctx = callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+    trigger_id = ctx.triggered[0]['prop_id']
+    if 'picker-detail-close' in trigger_id:
+        return 'modal-overlay hidden', '', ''
+
+    if not diagnosis_json:
+        return 'modal-overlay hidden', '', ''
+
+    try:
+        diagnosis = json.loads(diagnosis_json)
+    except Exception:
+        return 'modal-overlay hidden', '', ''
+
+    triggered_dict = None
+    try:
+        import re as _re
+        match = _re.search(r'"index":\s*"([^"]+)"', trigger_id)
+        if match:
+            triggered_dict = match.group(1)
+    except Exception:
+        pass
+
+    if not triggered_dict:
+        return 'modal-overlay hidden', '', ''
+
+    picker_record = None
+    for p in diagnosis.get('pickers', []):
+        if p['picker_name'] == triggered_dict:
+            picker_record = p
+            break
+
+    if not picker_record:
+        return 'modal-overlay hidden', '', ''
+
+    name = picker_record['picker_name']
+    title = f'📋 {name} 绩效诊断详情'
+
+    fig = create_picker_trend_chart(picker_record)
+    trend_chart = dcc.Graph(figure=fig, style={'marginBottom': '16px'})
+
+    label_chips = html.Div([
+        html.Span(label, className='picker-label-chip',
+                  style={'background': LABEL_COLORS.get(label, '#636EFA') + '22',
+                         'color': LABEL_COLORS.get(label, '#636EFA'),
+                         'borderColor': LABEL_COLORS.get(label, '#636EFA')})
+        for label in picker_record.get('labels', [])
+    ], className='picker-label-chips', style={'marginBottom': '16px'})
+
+    stats_row = html.Div([
+        html.Div([
+            html.Div('波次数', style={'fontSize': '12px', 'color': '#888'}),
+            html.Div(str(picker_record['waves']), style={'fontSize': '18px', 'fontWeight': 'bold'}),
+        ], className='picker-stat-card'),
+        html.Div([
+            html.Div('总SKU', style={'fontSize': '12px', 'color': '#888'}),
+            html.Div(f"{picker_record['total_sku']:,}", style={'fontSize': '18px', 'fontWeight': 'bold'}),
+        ], className='picker-stat-card'),
+        html.Div([
+            html.Div('效率', style={'fontSize': '12px', 'color': '#888'}),
+            html.Div(f"{picker_record['avg_eff']:.3f}", style={'fontSize': '18px', 'fontWeight': 'bold'}),
+        ], className='picker-stat-card'),
+        html.Div([
+            html.Div('差异率', style={'fontSize': '12px', 'color': '#888'}),
+            html.Div(f"{picker_record['avg_error_rate']:.2f}%", style={'fontSize': '18px', 'fontWeight': 'bold'}),
+        ], className='picker-stat-card'),
+        html.Div([
+            html.Div('等待', style={'fontSize': '12px', 'color': '#888'}),
+            html.Div(f"{picker_record['avg_wait']:.1f}分", style={'fontSize': '18px', 'fontWeight': 'bold'}),
+        ], className='picker-stat-card'),
+    ], className='picker-stats-row')
+
+    anomaly_section = None
+    anomalies = picker_record.get('anomaly_details', [])
+    if anomalies:
+        anomaly_rows = []
+        for a in anomalies:
+            anomaly_rows.append(html.Tr([
+                html.Td(a['date']),
+                html.Td(a['area']),
+                html.Td(str(a['sku_count'])),
+                html.Td(f"{a['pick_minutes']:.1f}"),
+                html.Td(str(a['error_count'])),
+                html.Td(f"{a['pack_wait_minutes']:.1f}"),
+                html.Td(a['reasons'], style={'color': '#EF553B', 'fontWeight': '500'}),
+            ]))
+        anomaly_section = html.Div([
+            html.H4('🚨 异常明细', style={'fontSize': '14px', 'margin': '16px 0 8px'}),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th('日期'), html.Th('仓区'), html.Th('SKU数'),
+                        html.Th('耗时(分)'), html.Th('差异数'), html.Th('等待(分)'), html.Th('异常类型'),
+                    ])),
+                    html.Tbody(anomaly_rows),
+                ], className='picker-anomaly-table'),
+            ], style={'overflowX': 'auto'}),
+        ])
+    else:
+        anomaly_section = html.Div('该拣货员无异常记录', style={'padding': '12px', 'color': '#999', 'fontSize': '13px'})
+
+    body = html.Div([
+        label_chips,
+        stats_row,
+        trend_chart,
+        anomaly_section,
+    ])
+
+    return 'modal-overlay', title, body
 
 
 if __name__ == '__main__':

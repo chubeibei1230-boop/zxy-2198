@@ -12,6 +12,8 @@ def build_export_workbook(
     trend_df: pd.DataFrame,
     anomaly_df: pd.DataFrame,
     suggestions: List[Dict] = None,
+    picker_diagnosis: Dict = None,
+    picker_suggestions: List[Dict] = None,
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -98,6 +100,50 @@ def build_export_workbook(
                     'priority': '优先级',
                 })
             sug_df.to_excel(writer, sheet_name='优化建议', index=False)
+        if picker_diagnosis and picker_diagnosis.get('pickers'):
+            diag_rows = []
+            for p in picker_diagnosis['pickers']:
+                diag_rows.append({
+                    '拣货员': p['picker_name'],
+                    '波次数': p['waves'],
+                    '总SKU量': p['total_sku'],
+                    '平均效率(SKU/分)': p['avg_eff'],
+                    '平均差异率(%)': p['avg_error_rate'],
+                    '平均等待(分)': p['avg_wait'],
+                    '累计差异数': p['total_error_count'],
+                    '诊断标签': '、'.join(p.get('labels', [])),
+                })
+            diag_df = pd.DataFrame(diag_rows)
+            diag_df.to_excel(writer, sheet_name='拣货员绩效诊断', index=False)
+            all_anomaly_rows = []
+            for p in picker_diagnosis['pickers']:
+                for a in p.get('anomaly_details', []):
+                    all_anomaly_rows.append({
+                        '拣货员': p['picker_name'],
+                        '日期': a['date'],
+                        '仓区': a['area'],
+                        'SKU数': a['sku_count'],
+                        '拣货耗时(分)': a['pick_minutes'],
+                        '差异数': a['error_count'],
+                        '包装等待(分)': a['pack_wait_minutes'],
+                        '备注': a['note'],
+                        '异常类型': a['reasons'],
+                    })
+            if all_anomaly_rows:
+                anom_detail_df = pd.DataFrame(all_anomaly_rows)
+                anom_detail_df.to_excel(writer, sheet_name='人员异常明细', index=False)
+        if picker_suggestions:
+            sug_imp_rows = []
+            for s in picker_suggestions:
+                sug_imp_rows.append({
+                    '拣货员': s['picker'],
+                    '诊断标签': '、'.join(s.get('labels', [])),
+                    '判定依据': s['reason'],
+                    '改进建议': s['advice'],
+                })
+            if sug_imp_rows:
+                imp_df = pd.DataFrame(sug_imp_rows)
+                imp_df.to_excel(writer, sheet_name='人员改进建议', index=False)
     return output.getvalue()
 
 

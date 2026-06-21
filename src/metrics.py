@@ -172,6 +172,143 @@ def get_date_range(df: pd.DataFrame) -> Tuple:
     return (dates[0], dates[-1])
 
 
+def compute_picker_diagnosis(df: pd.DataFrame) -> Dict:
+    if len(df) == 0:
+        return {'pickers': [], 'warnings': ['筛选后无数据，无法进行绩效诊断']}
+    picker_stats = df.groupby('picker_name').agg(
+        waves=('picker_name', 'size'),
+        total_sku=('sku_count', 'sum'),
+        avg_eff=('sku_per_minute', 'mean'),
+        avg_error_rate=('error_rate', 'mean'),
+        avg_wait=('pack_wait_minutes', 'mean'),
+        total_error_count=('error_count', 'sum'),
+    ).reset_index()
+    picker_stats['avg_eff'] = picker_stats['avg_eff'].round(3)
+    picker_stats['avg_error_rate'] = picker_stats['avg_error_rate'].round(2)
+    picker_stats['avg_wait'] = picker_stats['avg_wait'].round(2)
+    picker_stats['total_sku'] = picker_stats['total_sku'].astype(int)
+    overall_eff = df['sku_per_minute'].mean()
+    overall_error = df['error_rate'].mean()
+    overall_wait = df['pack_wait_minutes'].mean()
+    eff_q25 = picker_stats['avg_eff'].quantile(0.25) if len(picker_stats) >= 4 else overall_eff * 0.8
+    error_q75 = picker_stats['avg_error_rate'].quantile(0.75) if len(picker_stats) >= 4 else overall_error * 1.3
+    wait_q75 = picker_stats['avg_wait'].quantile(0.75) if len(picker_stats) >= 4 else overall_wait * 1.5
+    wait_iqr_q3 = picker_stats['avg_wait'].quantile(0.75) if len(picker_stats) >= 4 else 30
+    wait_iqr_q1 = picker_stats['avg_wait'].quantile(0.25) if len(picker_stats) >= 4 else 10
+    wait_upper = wait_iqr_q3 + 1.5 * (wait_iqr_q3 - wait_iqr_q1)
+    wait_threshold = max(wait_upper, 30)
+    labels_list = []
+    for _, row in picker_stats.iterrows():
+        labels = []
+        if row['avg_eff'] >= picker_stats['avg_eff'].quantile(0.75):
+            labels.append('表现优秀')
+        if row['avg_eff'] < eff_q25 and row['waves'] >= 3:
+            labels.append('效率偏低')
+        if row['avg_error_rate'] > error_q75 and row['total_error_count'] >= 1:
+            labels.append('差异偏高')
+        if row['avg_wait'] > wait_threshold and row['waves'] >= 3:
+            labels.append('等待异常')
+        if not labels:
+            labels.append('表现正常')
+        labels_list.append(labels)
+    picker_stats['labels'] = labels_list
+    warnings = []
+    if len(picker_stats) < 3:
+        warnings.append(f'当前仅 {len(picker_stats)} 位拣货员，样本量过少，标签判定参考价值有限，建议扩大筛选范围')
+    if len(picker_stats) >= 3 and picker_stats['waves'].max() < 5:
+        warnings.append('所有拣货员波次数均不足 5 次，统计数据稳定性较差，建议增加日期范围')
+    daily_trend = df.groupby(['date_only', 'picker_name']).agg(
+        waves=('picker_name', 'size'),
+        total_sku=('sku_count', 'sum'),
+        avg_eff=('sku_per_minute', 'mean'),
+        avg_error_rate=('error_rate', 'mean'),
+        avg_wait=('pack_wait_minutes', 'mean'),
+        total_error_count=('error_count', 'sum'),
+    ).reset_index()
+    daily_trend['avg_eff'] = daily_trend['avg_eff'].round(3)
+    daily_trend['avg_error_rate'] = daily_trend['avg_error_rate'].round(2)
+    daily_trend['avg_wait'] = daily_trend['avg_wait'].round(2)
+    picker_records = []
+    for _, row in picker_stats.iterrows():
+        name = row['picker_name']
+        person_daily = daily_trend[daily_trend['picker_name'] == name].copy()
+        person_daily = person_daily.sort_values('date_only')
+        person_anomalies = df[
+            (df['picker_name'] == name)
+            & ((df.get('_is_anomalous_wait', False)) | (df.get('_is_duplicate_wave', False)))
+        ].copy()
+        anomaly_list = []
+        if len(person_anomalies) > 0:
+            for _, ar in person_anomalies.iterrows():
+                reasons = []
+                if ar.get('_is_anomalous_wait', False):
+                    reasons.append(f"异常等待({ar.get('pack_wait_minutes', 0):.1f}分)")
+                if ar.get('_is_duplicate_wave', False):
+                    reasons.append('重复波次')
+                anomaly_list.append({
+                    'date': str(ar.get('date_only', '')),
+                    'area': str(ar.get('warehouse_area', '')),
+                    'sku_count': int(ar.get('sku_count', 0)),
+                    'pick_minutes': float(ar.get('pick_minutes', 0)),
+                    'error_count': int(ar.get('error_count', 0)),
+                    'pack_wait_minutes': float(ar.get('pack_wait_minutes', 0)),
+                    'note': str(ar.get('note', '')),
+                    'reasons': '、'.join(reasons),
+                })
+        picker_records.append({
+            'picker_name': name,
+            'waves': int(row['waves']),
+            'total_sku': int(row['total_sku']),
+            'avg_eff': float(row['avg_eff']),
+            'avg_error_rate': float(row['avg_error_rate']),
+            'avg_wait': float(row['avg_wait']),
+            'total_error_count': int(row['total_error_count']),
+            'labels': row['labels'],
+            'daily_trend': person_daily[['date_only', 'waves', 'total_sku', 'avg_eff', 'avg_error_rate', 'avg_wait']].to_dict('records'),
+            'anomaly_details': anomaly_list,
+        })
+    return {
+        'pickers': picker_records,
+        'warnings': warnings,
+        'thresholds': {
+            'eff_low': round(float(eff_q25), 3),
+            'error_high': round(float(error_q75), 2),
+            'wait_abnormal': round(float(wait_threshold), 2),
+        },
+    }
+
+
+def generate_picker_improvement_suggestions(diagnosis: Dict) -> List[Dict]:
+    suggestions = []
+    if not diagnosis or not diagnosis.get('pickers'):
+        return suggestions
+    for p in diagnosis['pickers']:
+        labels = p.get('labels', [])
+        if '表现正常' in labels or '表现优秀' in labels:
+            continue
+        reasons = []
+        advice = []
+        thresholds = diagnosis.get('thresholds', {})
+        if '效率偏低' in labels:
+            reasons.append(f"效率 {p['avg_eff']:.2f} SKU/分（低于阈值 {thresholds.get('eff_low', 0):.2f}）")
+            advice.append('建议观察其波次SKU构成是否偏大或仓区路径偏长，安排老带新跟班指导')
+        if '差异偏高' in labels:
+            reasons.append(f"差异率 {p['avg_error_rate']:.2f}%（高于阈值 {thresholds.get('error_high', 0):.2f}%），累计差异 {p['total_error_count']} 件")
+            advice.append('建议安排复核辅助或技能再培训，关注易错SKU拣货规范')
+        if '等待异常' in labels:
+            reasons.append(f"包装等待 {p['avg_wait']:.1f} 分（高于阈值 {thresholds.get('wait_abnormal', 0):.1f} 分）")
+            advice.append('建议检查其波次释放时序与包装工位配合，优化交接流程')
+        if reasons:
+            suggestions.append({
+                'picker': p['picker_name'],
+                'labels': labels,
+                'reason': '；'.join(reasons),
+                'advice': '；'.join(advice),
+            })
+    suggestions.sort(key=lambda x: len(x['labels']), reverse=True)
+    return suggestions
+
+
 def get_filter_options(df: pd.DataFrame) -> Dict:
     return {
         'warehouse_areas': sorted(df['warehouse_area'].dropna().astype(str).unique().tolist()),
